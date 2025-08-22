@@ -1,1 +1,73 @@
+name: Dev | Copy repo to server
 
+on:
+  workflow_dispatch: {}
+
+jobs:
+  clone-to-dev:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Ansible & SSH tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ansible openssh-client
+
+      - name: Set up SSH to dev server
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DO_SSH_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ secrets.DO_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Create tarball of current repo
+        run: |
+          tar -C "$GITHUB_WORKSPACE" -czf /tmp/repo.tgz .
+
+      - name: Write minimal Ansible playbook (clone/update repo)
+        run: |
+          cat > /tmp/push_repo.yml <<'PLAY'
+          - hosts: all
+            gather_facts: false
+            vars:
+              target_dir: /home/ansible/evan-chat-crew
+              sha: "{{ lookup('env','GITHUB_SHA') | default('unknown', true) }}"
+            tasks:
+              - name: Ensure target directory exists
+                become: true
+                ansible.builtin.file:
+                  path: "{{ target_dir }}"
+                  state: directory
+                  mode: '0755'
+
+              - name: Upload and extract repo
+                become: true
+                ansible.builtin.unarchive:
+                  src: /tmp/repo.tgz
+                  dest: "{{ target_dir }}"
+                  remote_src: false
+                  owner: ansible
+                  group: ansible
+
+              - name: Record deployed commit
+                become: true
+                ansible.builtin.copy:
+                  dest: "{{ target_dir }}/.deploy_commit"
+                  content: "{{ sha }}\n"
+                  mode: '0644'
+                  owner: ansible
+                  group: ansible
+          PLAY
+
+      - name: Push repo to dev server
+        run: |
+          scp -i ~/.ssh/id_rsa /tmp/repo.tgz ${{ secrets.DO_USER }}@${{ secrets.DO_HOST }}:/tmp/repo.tgz
+          ansible-playbook /tmp/push_repo.yml \
+            -i "${{ secrets.DO_HOST }}," \
+            -u "${{ secrets.DO_USER }}" \
+            --private-key ~/.ssh/id_rsa
+        env:
+          GITHUB_SHA: ${{ github.sha }}
